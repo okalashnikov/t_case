@@ -55,38 +55,64 @@ spec:
       labels:
         app: main-portal-app
     spec:
+      # Запрещаем монтирование service account token (если не требуется)
+      automountServiceAccountToken: false
+      # Создаем отдельный service account вместо default
+      serviceAccountName: main-portal-sa
       containers:
       - name: main-portal-container
-        image: alpine-image:v1.2.3
+        # Используем конкретную версию образа вместо latest
+        image: alpine-image:3.12
         ports:
         - containerPort: 80
-        env:
-        - name: DB_PASSWORD
-          valueFrom:
-            secretKeyRef:
-              name: db-secret
-              key: password
+        # Переносим секреты в отдельный объект Secret
+        envFrom:
+        - secretRef:
+            name: app-secrets
         securityContext:
+          # Запрещаем привилегированный режим
           privileged: false
+          # Запускаем от непривилегированного пользователя
           runAsUser: 1000
-          runAsNonRoot: true
-          readOnlyRootFilesystem: true
+          runAsGroup: 1000
+          # Запрещаем эскалацию привилегий
+          allowPrivilegeEscalation: false
+          # Только необходимые capabilities
           capabilities:
-            drop: ["ALL"]
-      serviceAccountName: restricted-sa
-      automountServiceAccountToken: false
+            drop:
+            - ALL
+          # Только для чтения корневая FS
+          readOnlyRootFilesystem: true
+        resources:
+          limits:
+            cpu: "1"
+            memory: "512Mi"
+      # Добавляем политику безопасности pod'а
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
 ---
 apiVersion: v1
 kind: Service
 metadata:
   name: main-portal-app
 spec:
-  type: NodePort
+  # Используем ClusterIP вместо NodePort, если не нужен доступ извне
+  type: ClusterIP
   ports:
   - port: 80
-    nodePort: 30080
   selector:
     app: main-portal-app
+---
+# Отдельный объект Secret для хранения чувствительных данных
+apiVersion: v1
+kind: Secret
+metadata:
+  name: app-secrets
+type: Opaque
+data:
+  DB_PASSWORD: "IXBAczV3MDByZCEhIyEk"  # Должно быть закодировано в base64
 ```
 
 ---
@@ -123,54 +149,56 @@ spec:
    - **🛠️ Исправление:** Создать отдельного пользователя.
 #### Исправленный Dockerfile:
 ```
-# Используем официальный образ с фиксированной версией
-FROM node:14.21.3-alpine as build
-
-# Безопасные ARG по умолчанию
-ARG SERVICE_NAME=gate
-ARG REGISTRY_URL=registry.hub.docker.com/library/
-
-WORKDIR /app
-
-# Копируем только необходимые файлы
-COPY package.json pnpm-lock.yaml ./
-COPY ./prisma ./prisma
-
-# Устанавливаем зависимости безопасно
-RUN npm install -g pnpm@7.14.0 @nestjs/cli@8.2.5 && \
-    pnpm install --frozen-lockfile && \
-    chown -R node:node /app  # Правильные права
-
-# Отдельный RUN для внешних скриптов с проверкой checksum
-# RUN curl -s https://github.com/somelibrary/blob/master/etc/library.sh | bash - заменено на:
-ADD --chown=node:node https://verified-domain.com/trusted-script.sh /tmp/
-RUN sha256sum /tmp/trusted-script.sh | grep -q "expected-checksum" && \
-    bash /tmp/trusted-script.sh && \
-    rm /tmp/trusted-script.sh
-
-RUN pnpm prisma generate && \
-    nest build $SERVICE_NAME
-
-# Финальный образ
-FROM node:14.21.3-alpine
-
-WORKDIR /app
-ARG SERVICE_NAME=gate
+# Используем официальный образ с конкретной версией LTS
+FROM node:20-alpine as build
 
 # Создаем непривилегированного пользователя
 RUN addgroup -S appgroup && adduser -S appuser -G appgroup
 
-# Копируем с правильными правами
+ARG SERVICE_NAME=gate
+WORKDIR /app
+
+# Копируем только необходимые файлы для установки зависимостей
+COPY package.json pnpm-lock.yaml .npmrc ./
+COPY prisma ./prisma
+
+# Устанавливаем pnpm глобально (лучше использовать локальную версию через npx)
+RUN npm install -g pnpm@8 && \
+    # Устанавливаем зависимости с frozen lockfile
+    pnpm install --frozen-lockfile && \
+    # Меняем владельца файлов
+    chown -R appuser:appgroup /app
+
+# Переключаемся на непривилегированного пользователя
+USER appuser
+
+# Копируем остальные файлы (исключая ненужные через .dockerignore)
+COPY --chown=appuser:appgroup . .
+
+# Генерируем клиент Prisma
+RUN pnpm prisma generate && \
+    # Собираем приложение
+    pnpm nest build $SERVICE_NAME
+
+# Финальный образ
+FROM node:20-alpine
+
+WORKDIR /app
+ARG SERVICE_NAME=gate
+
+# Создаем пользователя в финальном образе
+RUN addgroup -S appgroup && adduser -S appuser -G appgroup
+
+# Копируем только необходимые файлы из стадии build
 COPY --from=build --chown=appuser:appgroup /app/node_modules ./node_modules
-COPY --from=build --chown=appuser:appgroup /app/package.json ./package.json
+COPY --from=build --chown=appuser:appgroup /app/package.json ./
 COPY --from=build --chown=appuser:appgroup /app/dist/apps/${SERVICE_NAME} .
 COPY --from=build --chown=appuser:appgroup /app/prisma ./prisma
 
-USER appuser  # Запускаем от непривилегированного пользователя
+# Переключаемся на непривилегированного пользователя
+USER appuser
 
-HEALTHCHECK --interval=30s --timeout=3s \
-  CMD curl -f http://localhost/health || exit 1
-
+# Запускаем приложение
 ENTRYPOINT ["node", "main.js"]
 ```
 
