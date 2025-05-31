@@ -38,6 +38,57 @@
    - Дефолтный ServiceAccount может иметь избыточные права.  
    - **🛠️ Исправление:** Создать отдельный ServiceAccount с минимальными правами.
 
+#### Исправленный Kubernetes Deployment (deployment.yaml):
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: main-portal-app
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: main-portal-app
+  template:
+    metadata:
+      labels:
+        app: main-portal-app
+    spec:
+      containers:
+      - name: main-portal-container
+        image: alpine-image:v1.2.3
+        ports:
+        - containerPort: 80
+        env:
+        - name: DB_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: db-secret
+              key: password
+        securityContext:
+          privileged: false
+          runAsUser: 1000
+          runAsNonRoot: true
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop: ["ALL"]
+      serviceAccountName: restricted-sa
+      automountServiceAccountToken: false
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: main-portal-app
+spec:
+  type: NodePort
+  ports:
+  - port: 80
+    nodePort: 30080
+  selector:
+    app: main-portal-app
+```
+
 ---
 
 ## 🐳 Dockerfile
@@ -70,6 +121,58 @@
 
 7. **👑 Запуск от root**  
    - **🛠️ Исправление:** Создать отдельного пользователя.
+#### Исправленный Dockerfile:
+```
+# Используем официальный образ с фиксированной версией
+FROM node:14.21.3-alpine as build
+
+# Безопасные ARG по умолчанию
+ARG SERVICE_NAME=gate
+ARG REGISTRY_URL=registry.hub.docker.com/library/
+
+WORKDIR /app
+
+# Копируем только необходимые файлы
+COPY package.json pnpm-lock.yaml ./
+COPY ./prisma ./prisma
+
+# Устанавливаем зависимости безопасно
+RUN npm install -g pnpm@7.14.0 @nestjs/cli@8.2.5 && \
+    pnpm install --frozen-lockfile && \
+    chown -R node:node /app  # Правильные права
+
+# Отдельный RUN для внешних скриптов с проверкой checksum
+# RUN curl -s https://github.com/somelibrary/blob/master/etc/library.sh | bash - заменено на:
+ADD --chown=node:node https://verified-domain.com/trusted-script.sh /tmp/
+RUN sha256sum /tmp/trusted-script.sh | grep -q "expected-checksum" && \
+    bash /tmp/trusted-script.sh && \
+    rm /tmp/trusted-script.sh
+
+RUN pnpm prisma generate && \
+    nest build $SERVICE_NAME
+
+# Финальный образ
+FROM node:14.21.3-alpine
+
+WORKDIR /app
+ARG SERVICE_NAME=gate
+
+# Создаем непривилегированного пользователя
+RUN addgroup -S appgroup && adduser -S appuser -G appgroup
+
+# Копируем с правильными правами
+COPY --from=build --chown=appuser:appgroup /app/node_modules ./node_modules
+COPY --from=build --chown=appuser:appgroup /app/package.json ./package.json
+COPY --from=build --chown=appuser:appgroup /app/dist/apps/${SERVICE_NAME} .
+COPY --from=build --chown=appuser:appgroup /app/prisma ./prisma
+
+USER appuser  # Запускаем от непривилегированного пользователя
+
+HEALTHCHECK --interval=30s --timeout=3s \
+  CMD curl -f http://localhost/health || exit 1
+
+ENTRYPOINT ["node", "main.js"]
+```
 
 ### 🔍 Дополнительные рекомендации:
 - 🕵️‍♂️ Сканировать образы (`trivy`, `docker scan`)
@@ -81,12 +184,31 @@
 # 🧩 Часть 2. Решение практических кейсов
 
 ## 1. 🧩 Уязвимость в библиотеке без фиксов (CVE-2024-53382)
-**Действия:**
-- 🔍 Анализ использования проблемного функционала
-- 🛡️ Реализация дополнительных мер защиты
-- 🔄 Мониторинг появления обновлений
-- 📝 Документирование решений
-
+- Реализовать санитизацию входящих данных:
+  * Очистка HTML-тегов перед обработкой PrismJS
+  * Использование DOMPurify или аналогичных решений
+- Ограничить контекст выполнения:
+  * CSP (Content Security Policy) с запретом inline-скриптов
+  * Установка `trustedTypes` для контроля DOM-операций
+    
+## Обходное решение
+```
+// Патчинг уязвимого метода (пример)
+if (window.Prism && !Prism._patched) {
+  const originalHighlight = Prism.highlight;
+  Prism.highlight = function(text, grammar, language) {
+    // Санкционированная очистка текста
+    const sanitizedText = mySanitizer(text); 
+    return originalHighlight.call(this, sanitizedText, grammar, language);
+  };
+  Prism._patched = true;
+}
+```
+## Мониторинг
+- Подписаться на обновления PrismJS (GitHub/GitHub Advisory)
+- Настроить автоматические проверки SCA (раз в неделю)
+- Рассмотреть альтернативные подсветчики синтаксиса на будущее
+  
 ## 2. 🔑 Случайный коммит с AWS-ключом
 **Действия:**
 - 🚫 Немедленный отзыв ключа в AWS IAM
